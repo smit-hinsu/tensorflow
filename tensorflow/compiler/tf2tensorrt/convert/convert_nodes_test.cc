@@ -28,7 +28,6 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "tensorflow/cc/framework/ops.h"
 #include "tensorflow/cc/framework/scope.h"
-#include "tensorflow/cc/ops/nn_ops_internal.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/compiler/tf2tensorrt/plugin/trt_plugin_factory.h"
 #include "tensorflow/compiler/tf2tensorrt/utils/trt_logger.h"
@@ -1192,7 +1191,7 @@ class OpConverterTest : public ::testing::Test {
 
   // Add ITensor for both validation and conversion.
   void AddTestTensor(
-      const char* name, const std::vector<int32>& dims, int batch_size = 1,
+      const string& name, const std::vector<int32>& dims, int batch_size = 1,
       nvinfer1::DataType trt_dtype = nvinfer1::DataType::kFLOAT) {
     DataType tf_dtype = TrtDataTypeToTf(trt_dtype);
     ops::Placeholder::Attrs attrs;
@@ -2227,8 +2226,7 @@ void TestConvertSquare(OpConverterTest* test) {
   auto square = ops::Square(s.WithOpName("my_square"), input);
   NodeDef node_def = square.operation.node()->def();
 
-  test->AddTestTensor("input", {1, 20}, /*batch_size=*/1,
-                      TfDataTypeToTrt(dtype));
+  test->AddTestTensor("input", {1, 20});
   test->RunValidationAndConversion(node_def);
   TRT_TensorOrWeights output;
   TF_EXPECT_OK(test->GetTensorOrWeights("my_square", &output));
@@ -2414,7 +2412,7 @@ TEST_F(OpConverterTest, ConvertExpandDims) {
     AddTestWeights<int32>("weights", {1}, {0});
     RunValidationAndConversion(
         node_def, error::UNIMPLEMENTED,
-        "Modifying batch dimension is not supported for ExpandDims, at "
+        "Modifying batch dimension is not supported at "
         "my_expanddims");
   }
   {
@@ -2425,7 +2423,7 @@ TEST_F(OpConverterTest, ConvertExpandDims) {
     AddTestWeights<int32>("weights", {1}, {-5});
     RunValidationAndConversion(
         node_def, error::UNIMPLEMENTED,
-        "Modifying batch dimension is not supported for ExpandDims, at "
+        "Modifying batch dimension is not supported at "
         "my_expanddims");
   }
   {
@@ -2436,8 +2434,7 @@ TEST_F(OpConverterTest, ConvertExpandDims) {
     AddTestWeights<int32>("weights", {1}, {5});
     RunValidationAndConversion(
         node_def, error::INVALID_ARGUMENT,
-        "Axis for ExpandDims is invalid, must be in the range "
-        "[-rank(input) - 1, rank(input)], at my_expanddims");
+        "axis is invalid, must be in the range [-rank(input) - 1, rank(input)], at my_expanddims");
   }
   {
     // Axis < -rank(input)-1, should fail.
@@ -2447,8 +2444,7 @@ TEST_F(OpConverterTest, ConvertExpandDims) {
     AddTestWeights<int32>("weights", {1}, {-6});
     RunValidationAndConversion(
         node_def, error::INVALID_ARGUMENT,
-        "Axis for ExpandDims is invalid, must be in the range "
-        "[-rank(input) - 1, rank(input)], at my_expanddims");
+        "axis is invalid, must be in the range [-rank(input) - 1, rank(input)], at my_expanddims");
   }
 
   struct TestParams {
@@ -3546,6 +3542,40 @@ TEST_F(OpConverterTest, ConvertGather) {
   TestConvertGather<DT_FLOAT>(this);
   TestConvertGather<DT_HALF>(this);
   TestConvertGather<DT_INT32>(this);
+}
+
+TEST_F(OpConverterTest, ConvertPack) {
+  Scope s = Scope::NewRootScope();
+  tensorflow::OutputList inputs;
+  int num_inputs = 3;
+  inputs.reserve(num_inputs);
+  for (int i = 0; i < num_inputs; i++) {
+    inputs.push_back(ops::Placeholder(s.WithOpName(absl::StrCat("input_", i)), DT_INT32));
+  }
+  const auto attrs = ops::Stack::Attrs().Axis(1);
+  auto pack = ops::Stack(s.WithOpName("my_pack"), inputs, attrs);
+  const NodeDef& node_def = pack.operation.node()->def();
+
+  Reset();
+  for (int i = 0; i < num_inputs; i++) {
+    AddTestTensor(absl::StrCat("input_", i).c_str(), {1, 1}, 1, TfDataTypeToTrt(DT_INT32));
+  }
+  RunValidationAndConversion(node_def);
+
+  // DO NOT SUBMIT what happens to the dimension type in the output? why it is junk?
+  TRT_TensorOrWeights output;
+  TF_EXPECT_OK(GetTensorOrWeights("my_pack", &output));
+  EXPECT_TRUE(output.is_tensor());
+  ExpectTrtDimsEqualsArray({1, 3, 1}, output.tensor()->getDimensions());
+
+  const DataVec input_data{
+      {"input_0", test::AsTensor<float>({1}, {1, 1})},
+      {"input_1", test::AsTensor<float>({2}, {1, 1})},
+      {"input_2", test::AsTensor<float>({3}, {1, 1})}};
+  DataVec output_data{{"my_pack", ConstructTensor<float>(3)}};
+  BuildAndRun(input_data, &output_data);
+  EXPECT_THAT(GetSpanForData<float>(output_data[0]),
+              ElementsAre(1, 2, 3));
 }
 
 TEST_F(OpConverterTest, ConvertUnary) {

@@ -2174,44 +2174,29 @@ Status ConvertReshape(OpConverterParams* params) {
   return Status::OK();
 }
 
-Status ConvertExpandDims(OpConverterParams* params) {
-  const auto& inputs = params->inputs;
-  const auto& node_def = params->node_def;
-  TF_RETURN_IF_ERROR(
-      CheckInputsWeights(*params, {{"input", false}, {"axis", true}}));
-  TF_RETURN_IF_ERROR(AllowDataTypes(
-      *params, {DataType::DT_FLOAT, DataType::DT_HALF, DataType::DT_INT32}));
-  // Get input shape as vector.
-  TRT_TensorOrWeights input_tensor = inputs.at(0);
-  const nvinfer1::Dims dims = input_tensor.GetTrtDims();
+// DO NOT SUBMIT split this further so that parts are reusable
+Status ConvertExpandDimsInternal(absl::string_view node_name, const TRT_TensorOrWeights& tensor, int axis, bool validation_only, Converter* converter, const nvinfer1::ITensor** output) {
+  const nvinfer1::Dims dims = tensor.GetTrtDims();
   std::vector<int> input_dims(dims.d, dims.d + dims.nbDims);
   // Add batch dim back.
   input_dims.insert(input_dims.begin(), -1);
+
   const int input_rank = input_dims.size();
-  // Get axis to expand on.
-  TRT_ShapedWeights weights = inputs.at(1).weights();
-  if (weights.count() != 1) {
-    return errors::InvalidArgument("ExpandDims axis must be a scalar, at ",
-                                   node_def.name());
-  }
-  const int* weights_ptr =
-      static_cast<int*>(const_cast<void*>(weights.GetValues()));
-  int axis = weights_ptr[0];
+
   // Make sure axis is valid.
   if ((axis < (-input_rank - 1)) || (axis > input_rank)) {
     return errors::InvalidArgument(
-        "Axis for ExpandDims is invalid, must be in the range "
-        "[-rank(input) - 1, rank(input)], at ",
-        node_def.name());
+        "axis is invalid, must be in the range [-rank(input) - 1, rank(input)], at ",
+        node_name);
   }
+
   // Convert negative axis to corresponding positive axis.
   if (axis < 0) axis += input_rank + 1;
   if (axis == 0) {
     return errors::Unimplemented(
-        "Modifying batch dimension is not supported for ExpandDims, at ",
-        node_def.name());
+        "Modifying batch dimension is not supported at ", node_name);
   }
-  if (params->validation_only) return Status::OK();
+  if (validation_only) return Status::OK();
 
   // ExpandDims: Insert new dim of size 1.
   input_dims.insert(input_dims.begin() + axis, 1);
@@ -2219,9 +2204,33 @@ Status ConvertExpandDims(OpConverterParams* params) {
   nvinfer1::Dims new_dims;
   TF_RETURN_IF_ERROR(TensorShapeArrayToTrtDims(input_dims, &new_dims,
                                                /*ignore_first_dim=*/true));
+  TF_RETURN_IF_ERROR(converter->PrepareTensorForShape(
+      tensor, new_dims, /*validation_only=*/false, output));
+
+  return Status::OK();
+}
+
+Status ConvertExpandDims(OpConverterParams* params) {
+  const auto& inputs = params->inputs;
+  const auto& node_def = params->node_def;
+  TF_RETURN_IF_ERROR(AllowDataTypes(
+      *params, {DataType::DT_FLOAT, DataType::DT_HALF, DataType::DT_INT32}));
+  TF_RETURN_IF_ERROR(
+      CheckInputsWeights(*params, {{"input", false}, {"axis", true}}));
+  // Get axis to expand on.
+  TRT_ShapedWeights weights = inputs.at(1).weights();
+  if (weights.count() != 1) {
+    return errors::InvalidArgument("axis must be a scalar, at ",
+                                   node_def.name());
+  }
+  const int* weights_ptr =
+      static_cast<int*>(const_cast<void*>(weights.GetValues()));
+  int axis = weights_ptr[0];
+
   const nvinfer1::ITensor* output_tensor = nullptr;
-  TF_RETURN_IF_ERROR(params->converter->PrepareTensorForShape(
-      input_tensor, new_dims, /*validation_only=*/false, &output_tensor));
+  TF_RETURN_IF_ERROR(ConvertExpandDimsInternal(node_def.name(), inputs.at(0), axis, params->validation_only, params->converter, &output_tensor));
+  if (params->validation_only) return Status::OK();
+
   params->outputs->push_back(
       TRT_TensorOrWeights(const_cast<nvinfer1::ITensor*>(output_tensor)));
   return Status::OK();
@@ -3386,6 +3395,141 @@ Status ConvertReduce(OpConverterParams* params) {
   return Status::OK();
 }
 
+Status ConvertConcatInternal(absl::string_view node_name, absl::Span<const TRT_TensorOrWeights> inputs, int axis, bool validation_only, Converter* converter, nvinfer1::ITensor** output) {
+  // TODO(jie): early termination with no-op (attr_size==1)
+  if (!inputs.at(0).is_tensor()) {
+    return errors::InvalidArgument(
+        "Expected tensor input, at ", node_name);
+  }
+
+  auto dim = inputs.at(0).tensor()->getDimensions();
+  // dimension check
+  if (axis > dim.nbDims + 1 || axis < -(dim.nbDims + 1)) {
+    return errors::InvalidArgument(
+        "axis out of dimension range, at ", node_name);
+  }
+  if (axis == 0) {
+    return errors::InvalidArgument(
+        "batch dimension not supported, at ", node_name);
+  }
+  if (axis < 0) {
+    axis = dim.nbDims + axis + 1;
+  }
+
+  std::vector<nvinfer1::ITensor const*> inputs_vec;
+  // Shape check (all input tensor should have same shape)
+  // starting from 0 since we are probably also doing transpose here;
+  for (int i = 0; i < inputs.size(); i++) {
+    auto tensor_i = inputs.at(i).tensor();
+    auto dim_i = tensor_i->getDimensions();
+    if (dim_i.nbDims != dim.nbDims) {
+      return errors::InvalidArgument(
+          "inputs with inconsistent dimensions, at ",
+          node_name);
+    }
+    for (int j = 0; j < dim.nbDims; j++) {
+      // check dimension consistency on non-concatenate axis
+      if (j != axis - 1 && dim_i.d[j] != dim.d[j]) {
+        return errors::InvalidArgument(
+            "inputs with inconsistent shape, at",
+            node_name);
+      }
+    }
+
+    inputs_vec.push_back(tensor_i);
+  }
+  if (validation_only) return Status::OK();
+
+  nvinfer1::IConcatenationLayer* layer =
+      converter->network()->addConcatenation(
+          const_cast<nvinfer1::ITensor* const*>(inputs_vec.data()),
+          inputs_vec.size());
+  TFTRT_RETURN_ERROR_IF_NULLPTR(layer, node_name);
+  layer->setAxis(axis - 1);
+  *output = layer->getOutput(0);
+  return Status::OK();
+}
+
+
+// DO NOT SUBMIT should this be done in Grappler or something like that?
+// No -- Need to handle verification, clustering, etc...
+// DO NOT SUBMIT finish TODO
+// TODO(hinsu):
+
+// DO NOT SUBMIT add explanation ...
+// DO NOT SUBMIT Special handling for only one input.
+Status ConvertPack(OpConverterParams* params) {
+  const auto& inputs = params->inputs;
+  const auto& node_def = params->node_def;
+
+  int num_inputs = static_cast<int>(inputs.size());
+  for (int i = 0; i < num_inputs; i++) {
+    if (!inputs.at(i).is_tensor()) {
+      return errors::InvalidArgument(
+          "Pack in TRT only supports tensor inputs, at ", node_def.name());
+    }
+  }
+
+  TFAttrs attrs(node_def);
+  // DO NOT SUBMIT negative axis?
+  const int64 axis = attrs.get<int64>("axis");
+
+  // TensorRT does not support Pack op natively but Pack op can be ... DO NOT
+  // SUBMIT
+  // First, ...
+  std::vector<TRT_TensorOrWeights> concat_inputs;
+  concat_inputs.reserve(num_inputs);
+  for (int i = 0; i < num_inputs; i++) {
+    const nvinfer1::ITensor* output_tensor;
+    TF_RETURN_IF_ERROR(ConvertExpandDimsInternal(node_def.name(), inputs.at(i), axis, params->validation_only, params->converter, &output_tensor));
+
+    // DO NOT SUBMIT just drop const from all places?
+    if (!params->validation_only) {
+      concat_inputs.push_back(TRT_TensorOrWeights(const_cast<nvinfer1::ITensor*>(output_tensor)));
+      concat_inputs.back().set_batch_size(inputs.at(i).batch_size());
+    }
+  }
+  if (params->validation_only) return Status::OK();
+
+  nvinfer1::ITensor* output_tensor;
+  // DO NOT SUBMIT is axis + 1 correct?
+  TF_RETURN_IF_ERROR(ConvertConcatInternal(node_def.name(), concat_inputs, axis + 1, params->validation_only, params->converter, &output_tensor));
+  params->outputs->push_back(TRT_TensorOrWeights(output_tensor));
+  return Status::OK();
+
+  // auto dims_0 = inputs.at(0).tensor()->getDimensions();
+  // for (int i = 1; i < num_inputs; i++) {
+  //   auto dims_i = inputs.at(i).tensor()->getDimensions();
+  // DO NOT SUBMIT
+  // if (dims_0 != dims_i) {
+  //   return errors::InvalidArgument(
+  //       "Pack received inputs with inconsistent dimensions, at ",
+  //       node_def.name());
+  // }
+  // }
+
+  // DO NOT SUBMIT any other validation?
+  // if (params->validation_only) return Status::OK();
+
+  // DO NOT SUBMIT do we verify attribute N is equal to size of values? Does TF
+  // already does this? Is this otherwise common in TensorRT?
+
+  // DO NOT SUBMIT Return error if input dims is equal to MAX_DIMS?
+
+  // LOG(INFO) << "DO NOT SUBMIT num_inputs = " << num_inputs << " axis = " << axis;
+  // DO NOT SUBMIT error handling for axis?
+
+  // nvinfer1::IConcatenationLayer* layer =
+  //     params->converter->network()->addConcatenation(
+  //         const_cast<nvinfer1::ITensor* const*>(concat_inputs.data()),
+  //         concat_inputs.size());
+  // TFTRT_RETURN_ERROR_IF_NULLPTR(layer, node_def.name());
+  // // DO NOT SUBMIT is this correct?
+  // layer->setAxis(axis);
+  // nvinfer1::ITensor* output_tensor = layer->getOutput(0);
+  //   LOG(INFO) << " DO NOT SUBMIT inter dims = " << DebugString(output_tensor->getDimensions());
+}
+
 Status ConvertPad(OpConverterParams* params) {
   const auto& inputs = params->inputs;
   const auto& node_def = params->node_def;
@@ -3500,75 +3644,26 @@ Status ConvertConcat(OpConverterParams* params) {
   TF_RETURN_IF_ERROR(
       AllowDataTypes(*params, {DataType::DT_FLOAT, DataType::DT_HALF}));
   // not including the last input (axis) here
-  int input_size = static_cast<int>(inputs.size()) - 1;
 
-  if (!inputs.at(0).is_tensor()) {
-    return errors::InvalidArgument(
-        "Concat in TRT support only Tensor input, at ", node_def.name());
-  }
-
-  // We are retrieving the axis
-  TRT_ShapedWeights axis = inputs.at(input_size).weights();
-
+  // DO NOT SUBMIT add check on min inputs.
   TFAttrs attrs(node_def);
-  auto index_type = attrs.get<DataType>("Tidx");
+  auto axis_type = attrs.get<DataType>("Tidx");
 
   // TODO(jie): handle data type
-  // Only expect to handle INT32 as index attributes for now
-  if (index_type != DataType::DT_INT32)
+  // Only expect to handle INT32 as axis attributes for now
+  if (axis_type != DataType::DT_INT32)
     return errors::Unimplemented("Tidx supports only DT_INT32, at ",
                                  node_def.name());
 
-  int index = *(static_cast<int*>(const_cast<void*>(axis.GetValues())));
+  // We are retrieving the axis
+  TRT_ShapedWeights axis_weights = inputs.back().weights();
+  int axis = *(static_cast<int*>(const_cast<void*>(axis_weights.GetValues())));
 
-  // TODO(jie): early termination with no-op (attr_size==1)
-
-  auto dim = inputs.at(0).tensor()->getDimensions();
-  // dimension check
-  if (index > dim.nbDims + 1) {
-    return errors::InvalidArgument(
-        "Concatenate on axis out of dimension range, at ", node_def.name());
-  }
-  if (index == 0) {
-    return errors::InvalidArgument(
-        "Concatenate on batch dimension not supported, at ", node_def.name());
-  }
-  if (index < 0) {
-    index = dim.nbDims + index + 1;
-  }
-
-  std::vector<nvinfer1::ITensor const*> inputs_vec;
-  // Shap chack (all input tensor should have same shape)
-  // starting from 0 since we are probably also doing transpose here;
-  for (int i = 0; i < input_size; i++) {
-    auto tensor_i = inputs.at(i).tensor();
-    auto dim_i = tensor_i->getDimensions();
-    if (dim_i.nbDims != dim.nbDims) {
-      return errors::InvalidArgument(
-          "Concatenate receives inputs with inconsistent dimensions, at ",
-          node_def.name());
-    }
-    for (int j = 0; j < dim.nbDims; j++) {
-      // check dimension consistency on non-concatenate axis
-      if (j != index - 1 && dim_i.d[j] != dim.d[j]) {
-        return errors::InvalidArgument(
-            "Concatenate receives inputs with inconsistent shape, at",
-            node_def.name());
-      }
-    }
-
-    inputs_vec.push_back(tensor_i);
-  }
+  auto tensors = absl::Span<const TRT_TensorOrWeights>(inputs).subspan(0, inputs.size() - 1);
+  nvinfer1::ITensor* output_tensor;
+  TF_RETURN_IF_ERROR(ConvertConcatInternal(node_def.name(), tensors, axis, params->validation_only, params->converter, &output_tensor));
   if (params->validation_only) return Status::OK();
 
-  // nvinfer1::ITensor const* tensor = inputs.at(0).tensor();
-  nvinfer1::IConcatenationLayer* layer =
-      params->converter->network()->addConcatenation(
-          const_cast<nvinfer1::ITensor* const*>(inputs_vec.data()),
-          inputs_vec.size());
-  TFTRT_RETURN_ERROR_IF_NULLPTR(layer, node_def.name());
-  layer->setAxis(index - 1);
-  nvinfer1::ITensor* output_tensor = layer->getOutput(0);
   params->outputs->push_back(TRT_TensorOrWeights(output_tensor));
   return Status::OK();
 }
@@ -3997,6 +4092,7 @@ static void RegisterValidatableOpConverters(
   (*registration)["GatherV2"] = ConvertGather;
   (*registration)["LeakyRelu"] = ConvertLeakyRelu;
   (*registration)["MatMul"] = ConvertMatMul;
+  (*registration)["Pack"] = ConvertPack;
   (*registration)["Pad"] = ConvertPad;
   (*registration)["Relu6"] = ConvertRelu6;
   (*registration)["Reshape"] = ConvertReshape;

@@ -299,10 +299,10 @@ class TRT_TensorOrWeights {
 
   string DebugString() const;
 
+  void set_batch_size(int batch_size) { batch_size_ = batch_size; }
+
  private:
   class SimpleITensor;
-
-  void set_batch_size(int batch_size) { batch_size_ = batch_size; }
 
   // When it represents an ITensor, the ITensor can be either passed by the
   // caller via the constructor that takes an ITensor* as parameter, or be
